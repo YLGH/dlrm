@@ -17,6 +17,7 @@ import torchmetrics as metrics
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from pyre_extensions import none_throws
 from torch import distributed as dist, nn
+import torchrec.distributed as trec_dist
 from torch.utils.data import DataLoader
 from torchrec import EmbeddingBagCollection
 from torchrec.datasets.criteo import (
@@ -544,10 +545,73 @@ def main(argv: List[str]) -> None:
         EmbeddingBagCollectionSharder(fused_params=fused_params),
     ]
 
+    pg = dist.GroupMember.WORLD
+    world_size = dist.get_world_size(pg)
+    local_world_size = trec_dist.comm.get_local_size(world_size)
+    hbm_cap = None
+    if device.type == "cuda":
+        hbm_cap = torch.cuda.get_device_properties(device).total_memory
+
+    from collections import defaultdict
+    constraints = defaultdict(lambda: trec_dist.planner.ParameterConstraints())
+    for embedding_bag_config in eb_configs:
+        if embedding_bag_config.num_embeddings > 128:
+            pass
+            # constraints[embedding_bag_config.name].sharding_types = ["table_wise"]
+        else:
+            constraints[embedding_bag_config.name].sharding_types = ["data_parallel", "table_wise"]
+        constraints[embedding_bag_config.name].pooling_factors = [1.0]
+    # 45833188,
+    # 36746,
+    # 17245,
+    # 7413,
+    # 20243,
+    # 3,
+    # 7114,
+    # 1441,
+    # 62,
+    # 29275261,
+    # 1572176,
+    # 345138,
+    # 10,
+    # 2209,
+    # 11267,
+    # 128,
+    # 4,
+    # 974,
+    # 14,
+    # 48937457,
+    # 11316796,
+    # 40094537,
+    # 452104,
+    # 12606,
+    # 104,
+    # 35
+
+    plan = trec_dist.planner.EmbeddingShardingPlanner(
+            topology=trec_dist.planner.Topology(
+                world_size=world_size,
+                compute_device=device.type,
+                local_world_size=local_world_size,
+                hbm_cap=hbm_cap,
+                batch_size=args.batch_size,
+            ),
+            storage_reservation=trec_dist.planner.storage_reservations.HeuristicalStorageReservation(
+                percentage=0.05,
+            ),
+            constraints=constraints,
+            debug=True,
+            # pyre-ignore [6]
+        ).collective_plan(train_model, sharders, pg)
+
+    if dist.get_rank() == 0:
+        print("Plan is", plan)
+
     model = DistributedModelParallel(
         module=train_model,
         device=device,
         sharders=cast(List[ModuleSharder[nn.Module]], sharders),
+        plan=plan,
     )
 
     def optimizer_with_params():
@@ -560,6 +624,12 @@ def main(argv: List[str]) -> None:
         dict(model.named_parameters()),
         optimizer_with_params(),
     )
+    
+    # model._dmp_wrapped_module._register_fused_optim(
+    #     optim=torch.optim.SGD,
+    #     lr=args.learning_rate
+    # )
+
     optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
 
     train_pipeline = TrainPipelineSparseDist(
@@ -567,6 +637,7 @@ def main(argv: List[str]) -> None:
         optimizer,
         device,
     )
+
     train_val_test(
         args, train_pipeline, train_dataloader, val_dataloader, test_dataloader
     )
